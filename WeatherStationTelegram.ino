@@ -12,7 +12,7 @@
 #include "Adafruit_BME280.h"
 #include "Adafruit_Sensor.h"
 
-// Указати ваші дані Wi-Fi
+// Вкажіть ваші дані Wi-Fi
 const char* ssid = "SSID";
 const char* password = "Password";
 // Використовуйте @myidbot для отримання ID користувача
