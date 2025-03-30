@@ -1,9 +1,9 @@
 #ifdef ESP32
 #include "WiFi.h"
-#include "EEPROM.h"
+#include "LittleFS.h"
 #else
 #include "ESP8266WiFi.h"
-#include "EEPROM.h"
+#include "LittleFS.h"
 #endif
 
 #include "WiFiClientSecure.h"
@@ -12,7 +12,7 @@
 #include "Adafruit_BME280.h"
 #include "Adafruit_Sensor.h"
 
-// Вкажіть ваші дані Wi-Fi
+// Указати ваші дані Wi-Fi
 const char* ssid = "SSID";
 const char* password = "Password";
 // Використовуйте @myidbot для отримання ID користувача
@@ -39,41 +39,54 @@ struct TempData {
   float minTemp;
   char maxTime[20];
   char minTime[20];
-  float temps[30];  // Для зберігання температур за 30 днів
-  unsigned long timestamps[30];  // Часові мітки для 30 днів
-  int dayIndex;  // Індекс для циклічного оновлення температур
-  bool isInitialized;  // Прапор для перевірки ініціалізації
+  char lastReset[11];  // Останній день/тиждень/місяць скидання (YYYY-MM-DD)
+  bool isInitialized;
 };
 
-// Дані температури, вологості та тиску
 TempData daily, weekly, monthly;
 
-const int EEPROM_SIZE = sizeof(TempData) * 3;
 unsigned long lastTempCheck = 0;
-const int tempCheckInterval = 10000;  // Перевірка температури кожні 10 секунд
-unsigned long lastEEPROMsave = 0;
-const int eepromSaveInterval = 3600000;  // Збереження в EEPROM раз на годину (3600 секунд)
+const int tempCheckInterval = 60000;  // Перевірка температури кожну хвилину (60 секунд)
+unsigned long lastSave = 0;
+const int saveInterval = 3600000;  // Збереження раз на годину (3600 секунд)
+unsigned long lastTimeSync = 0;       // Для періодичної ресинхронізації часу
 
 void saveTempData(int address, TempData &data) {
-  EEPROM.put(address, data);
-  EEPROM.commit();
+  String filename = "/tempdata_" + String(address) + ".bin";
+  File file = LittleFS.open(filename, "w");
+  if (!file) {
+    Serial.println("Не вдалося відкрити файл для запису: " + filename);
+    return;
+  }
+  file.write((uint8_t*)&data, sizeof(TempData));
+  file.close();
 }
 
 void loadTempData(int address, TempData &data) {
-  EEPROM.get(address, data);
-  if (!data.isInitialized || isnan(data.maxTemp) || isnan(data.minTemp)) {
-    // Ініціалізація за замовчуванням
+  String filename = "/tempdata_" + String(address) + ".bin";
+  File file = LittleFS.open(filename, "r");
+  if (!file) {
+    // Файл не існує, ініціалізуємо за замовчуванням
     data.maxTemp = -1000.0;
     data.minTemp = 1000.0;
     strcpy(data.maxTime, "");
     strcpy(data.minTime, "");
-    data.dayIndex = 0;
-    for (int i = 0; i < 30; i++) {
-      data.temps[i] = 0.0;
-      data.timestamps[i] = 0;
-    }
+    strcpy(data.lastReset, "");
     data.isInitialized = true;
-    saveTempData(address, data);  // Зберігаємо ініціалізовані дані
+    saveTempData(address, data);
+  } else {
+    file.read((uint8_t*)&data, sizeof(TempData));
+    file.close();
+    if (!data.isInitialized || isnan(data.maxTemp) || isnan(data.minTemp)) {
+      // Дані пошкоджені, ініціалізуємо
+      data.maxTemp = -1000.0;
+      data.minTemp = 1000.0;
+      strcpy(data.maxTime, "");
+      strcpy(data.minTime, "");
+      strcpy(data.lastReset, "");
+      data.isInitialized = true;
+      saveTempData(address, data);
+    }
   }
 }
 
@@ -88,46 +101,76 @@ String getTime() {
   return String(timeString);
 }
 
+bool isNewPeriod(int address, const String& currentDay, const String& lastReset) {
+  if (lastReset == "") return true;  // Якщо ще не було скидання
+
+  time_t now = time(nullptr);
+  struct tm currentTime;
+  localtime_r(&now, &currentTime);
+
+  struct tm resetTime;
+  sscanf(lastReset.c_str(), "%d-%d-%d", &resetTime.tm_year, &resetTime.tm_mon, &resetTime.tm_mday);
+  resetTime.tm_year -= 1900;  // Рік від 1900
+  resetTime.tm_mon -= 1;      // Місяць від 0
+  resetTime.tm_hour = 0;
+  resetTime.tm_min = 0;
+  resetTime.tm_sec = 0;
+
+  time_t resetTimestamp = mktime(&resetTime);
+  double diffSeconds = difftime(now, resetTimestamp);
+
+  if (address == 0) {  // Daily
+    return diffSeconds >= 24 * 3600;  // Новий день
+  } else if (address == sizeof(TempData)) {  // Weekly
+    return diffSeconds >= 7 * 24 * 3600;  // Новий тиждень
+  } else {  // Monthly
+    return diffSeconds >= 30 * 24 * 3600;  // Новий місяць (приблизно)
+  }
+}
+
 void updateTempData(TempData &data, int address) {
   float temperature = bme.readTemperature();
   String currentTime = getTime();
+  String currentDay = currentTime.substring(0, 10);
   bool shouldSave = false;
 
-  // Оновлення температури за 30 днів
-  data.temps[data.dayIndex] = temperature;
-  data.timestamps[data.dayIndex] = millis();  // Поточний час
-  data.dayIndex = (data.dayIndex + 1) % 30;  // Перехід до наступного дня (циклічно)
+  // Перевірка на новий період і скидання
+  if (isNewPeriod(address, currentDay, String(data.lastReset))) {
+    data.maxTemp = -1000.0;
+    data.minTemp = 1000.0;
+    strcpy(data.maxTime, "");
+    strcpy(data.minTime, "");
+    currentDay.toCharArray(data.lastReset, 11);
+    shouldSave = true;
+  }
 
-  // Оновлення максимальних та мінімальних температур
+  // Оновлення максимуму та мінімуму
   if (temperature > data.maxTemp) {
     data.maxTemp = temperature;
     currentTime.toCharArray(data.maxTime, 20);
-    shouldSave = true;  // Зміна максимуму - зберігаємо
+    shouldSave = true;
   }
   if (temperature < data.minTemp) {
     data.minTemp = temperature;
     currentTime.toCharArray(data.minTime, 20);
-    shouldSave = true;  // Зміна мінімуму - зберігаємо
+    shouldSave = true;
   }
 
-  // Збереження в EEPROM лише при зміні або раз на годину
-  if (shouldSave || (millis() - lastEEPROMsave > eepromSaveInterval)) {
+  if (shouldSave || (millis() - lastSave > saveInterval)) {
     saveTempData(address, data);
-    lastEEPROMsave = millis();
+    lastSave = millis();
   }
 }
 
 String getReadings() {
   float temperature = bme.readTemperature();
   float humidity = bme.readHumidity();
-  float pressure = bme.readPressure() / 100.0F; // Перетворення тиску в гПа
+  float pressure = bme.readPressure() / 100.0F;
 
-  // Якщо температура <= 0, додаємо сніжинку ❄️
   String temperatureEmoji = "🌡️ Температура повітря: *" + String(temperature) + "* ºC";
   if (temperature <= 0) {
-    temperatureEmoji += " ❄️";  // Додаємо сніжинку
+    temperatureEmoji += " ❄️";
   }
-  // Форматування повідомлення
   String message = temperatureEmoji + "\n";
   message += "💧 Вологість повітря: *" + String(humidity) + "* %\n";
   message += "🌬️ Атмосферний тиск: *" + String(pressure) + "* гПа (" + String(pressure * 0.750062) + " мм рт. ст.)\n";
@@ -149,7 +192,6 @@ void handleNewMessages(int numNewMessages) {
       welcome += "📊 /tempw - найвища та найнижча температура повітря за останні 7 днів\n";
       welcome += "📊 /tempm - найвища та найнижча температура повітря за останні 30 днів\n";
       
-      // Додаємо команди очищення тільки для адміністратора
       if (chat_id == CHAT_ID) {
         welcome += "🧹 /cleartempd - очистити дані за день (адміністратор)\n";
         welcome += "🧹 /cleartempw - очистити дані за тиждень (адміністратор)\n";
@@ -224,23 +266,15 @@ void handleNewMessages(int numNewMessages) {
 void setup() {
   Serial.begin(115200);
 
-#ifdef ESP8266
-  configTime(2 * 3600, 0, "0.ua.pool.ntp.org"); // Отримуємо час через NTP
-  client.setTrustAnchors(&cert); // Сертифікат для Telegram
-#endif
-
-  // Ініціалізація датчика
-  if (!bme.begin(0x76)) {
-    Serial.println("Не вдалося підключити датчик!");
-    while (true);
-  }
-
-  // Підключення до Wi-Fi
+  // Налаштування Wi-Fi
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
 #ifdef ESP32
-  client.setCACert(TELEGRAM_CERTIFICATE_ROOT); // Додаємо сертифікат для Telegram
+  client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+#endif
+#ifdef ESP8266
+  client.setTrustAnchors(&cert);
 #endif
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -248,13 +282,47 @@ void setup() {
     Serial.println("Підключення до Wi-Fi...");
   }
 
-  EEPROM.begin(EEPROM_SIZE);
+  // Налаштування часу з урахуванням часового поясу України
+  configTime(0, 0, "0.ua.pool.ntp.org", "pool.ntp.org"); // UTC без зміщення в коді
+
+  // Вказуємо часовий пояс України з автоматичним DST
+  setenv("TZ", "EET-2EEST,M3.5.0/3,M10.5.0/4", 1); // Східноєвропейський час (EET) з DST
+  tzset(); // Застосовуємо налаштування часового поясу
+
+  // Чекаємо синхронізації часу
+  Serial.println("Очікування синхронізації часу...");
+  time_t now = time(nullptr);
+  while (now < 8 * 3600) { // Чекаємо, поки час стане валідним
+    delay(500);
+    now = time(nullptr);
+  }
+  Serial.println("Час синхронізовано!");
+
+  // Ініціалізація BME280
+  if (!bme.begin(0x76)) {
+    Serial.println("Не вдалося підключити датчик!");
+    while (true);
+  }
+
+  // Ініціалізація LittleFS
+  if (!LittleFS.begin()) {
+    Serial.println("Не вдалося ініціалізувати LittleFS!");
+    while (true);
+  }
+
   loadTempData(0, daily);
   loadTempData(sizeof(TempData), weekly);
   loadTempData(sizeof(TempData) * 2, monthly);
 }
 
 void loop() {
+  // Періодична ресинхронізація часу (раз на добу)
+  if (millis() - lastTimeSync > 24 * 3600 * 1000) {
+    configTime(0, 0, "0.ua.pool.ntp.org", "pool.ntp.org");
+    lastTimeSync = millis();
+    Serial.println("Час ресинхронізовано!");
+  }
+
   if (millis() > lastTempCheck + tempCheckInterval) {
     updateTempData(daily, 0);
     updateTempData(weekly, sizeof(TempData));
